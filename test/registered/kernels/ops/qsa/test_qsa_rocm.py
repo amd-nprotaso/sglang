@@ -174,3 +174,7 @@ def test_qsa_hip_tilelang_decode_matches_production_shape():
     finite = torch.isfinite(expected)
     assert torch.equal(torch.isfinite(actual), finite)
     torch.testing.assert_close(actual[finite], expected[finite], atol=5e-2, rtol=2e-2)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

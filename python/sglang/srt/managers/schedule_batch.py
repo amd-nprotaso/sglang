@@ -3000,13 +3000,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # names a position no page can hold. Donate only where an h snapshot exists.
         prefix_len = len(req.prefix_indices)
         seq_end = prefix_len + req.extend_range.length
-        # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-        # mamba radix cache to track which seqlen this mamba state should store at.
-        mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
-        mask = (
-            mamba_track_seqlen_aligned > prefix_len
-            and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
-        )
+        # Exact chunk fill (gfx95) can end a chunk off the tree page; a relative
+        # depth from such a prefix names no radix node, so use the absolute grid.
+        if get_parallel().dcp_enabled or prefix_len % self.tree_cache.page_size != 0:
+            # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
+            # absolute page depth only when the kernel produced an h snapshot.
+            mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid
+            mask = (
+                mamba_track_seqlen_aligned > prefix_len
+                and (mamba_track_seqlen_aligned - prefix_len) % cache_chunk_size == 0
+            )
+        else:
+            # Chunked prefill can leave an active request off the absolute
+            # checkpoint grid. Without DCP, keep tracking snapshots relative to
+            # that request prefix so later chunks can continue donating states.
+            mask = req.extend_range.length >= checkpoint_grid
+            mamba_track_seqlen_aligned = (
+                prefix_len
+                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
+            )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()
