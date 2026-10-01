@@ -794,6 +794,36 @@ class DefaultModelLoader(BaseModelLoader):
         )
         return _prefetch_all_checkpoints(weight_files, num_threads=num_threads)
 
+    def _get_checkpoint_quantization_config(
+        self, model_config: ModelConfig
+    ) -> Optional[QuantizationConfig]:
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        # A serialized target's quantization metadata may not describe its
+        # embedded draft. Resolve the draft from checkpoint headers before
+        # constructing layers or deciding shared-expert fusion.
+        if (
+            quant_config is not None
+            and model_config.is_draft_model
+            and quant_config.get_name() == "quark"
+        ):
+            model_class, _ = get_model_architecture(model_config)
+            resolve_quantization = getattr(
+                model_class, "resolve_checkpoint_quantization", None
+            )
+            if resolve_quantization is not None:
+                hf_folder, weight_files, use_safetensors = self._prepare_weights(
+                    model_config.model_path, model_config.revision, True
+                )
+                if use_safetensors:
+                    weight_files = maybe_add_mtp_safetensors(
+                        weight_files,
+                        hf_folder,
+                        "model.safetensors.index.json",
+                        model_config.hf_config,
+                    )
+                    quant_config = resolve_quantization(quant_config, weight_files)
+        return quant_config
+
     def initialize_model_for_startup(
         self,
         *,
@@ -802,7 +832,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> nn.Module:
         """Build the final model structure and GPU parameter storage."""
         target_device = torch.device(device_config.device)
-        quant_config = _get_quantization_config(model_config, self.load_config)
+        quant_config = self._get_checkpoint_quantization_config(model_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
@@ -976,7 +1006,7 @@ class DefaultModelLoader(BaseModelLoader):
             return model.eval()
 
         target_device = torch.device(device_config.device)
-        quant_config = _get_quantization_config(model_config, self.load_config)
+        quant_config = self._get_checkpoint_quantization_config(model_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
