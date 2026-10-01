@@ -3039,7 +3039,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         prefix_len = len(req.prefix_indices)
         seq_end = prefix_len + req.extend_range.length
-        if get_parallel().dcp_enabled:
+        # Exact chunk fill (gfx95) can end a chunk off the tree page; a relative
+        # depth from such a prefix names no radix node, so use the absolute grid.
+        if get_parallel().dcp_enabled or prefix_len % self.tree_cache.page_size != 0:
             # DCP widens radix pages beyond scheduler chunk boundaries. Pick an
             # absolute page depth only when the kernel produced an h snapshot.
             mamba_track_seqlen_aligned = (seq_end // checkpoint_grid) * checkpoint_grid

@@ -119,9 +119,22 @@ class TestMambaCheckpointDepth(unittest.TestCase):
         # Active requests can stop off the absolute grid between prefill chunks.
         # Keep donating their prefix-relative snapshots when DCP is disabled.
         self.assertEqual(
-            _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
-            20637,
+            _track_seqlen(tree_page=16, prefix_len=4256, extend_len=16384),
+            20640,
         )
+
+    def test_non_dcp_off_page_prefix_never_donates_off_page(self):
+        # Exact chunk fill can leave the prefix off the tree page (7192 % 64 == 24);
+        # a relative depth of 15384 would be floored to a 15360 node.
+        for tree_page, prefix_len, extend_len in (
+            (CHUNK, 7192, 8192),
+            (16, 4253, 16384),
+        ):
+            with self.subTest(tree_page=tree_page, prefix_len=prefix_len):
+                depth = _track_seqlen(
+                    tree_page=tree_page, prefix_len=prefix_len, extend_len=extend_len
+                )
+                self.assertTrue(depth is None or depth % tree_page == 0)
 
 
 class TestMambaTrackGrid(unittest.TestCase):
