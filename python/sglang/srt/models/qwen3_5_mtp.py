@@ -96,6 +96,47 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
     @staticmethod
+    def resolve_checkpoint_quantization(quant_config, weight_files: Iterable[str]):
+        """Honor an unquantized MTP branch even when Quark excludes omit it.
+
+        Inspect headers before model construction (including the fusion gate).
+        Only disable quantization when the entire MTP branch is floating point;
+        a packed expert or a quantization scale keeps the serialized scheme.
+        """
+        if (
+            quant_config is None
+            or quant_config.get_name() != "quark"
+            or getattr(quant_config, "online_scheme", None) is not None
+        ):
+            return quant_config
+
+        from safetensors import safe_open
+
+        found_expert = False
+        for filename in weight_files:
+            with safe_open(filename, framework="pt", device="cpu") as checkpoint:
+                for name in checkpoint.keys():
+                    if not name.startswith("mtp."):
+                        continue
+                    if "scale" in name or "zero_point" in name:
+                        return quant_config
+                    if checkpoint.get_slice(name).get_dtype() not in (
+                        "BF16",
+                        "F16",
+                        "F32",
+                    ):
+                        return quant_config
+                    if ".mlp.experts." in name and name.endswith(".weight"):
+                        found_expert = True
+        if found_expert:
+            logger.info(
+                "Checkpoint MTP weights are unquantized; disabling Quark "
+                "quantization for the draft model."
+            )
+            return None
+        return quant_config
+
+    @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
             getattr(hf_config, "text_config", hf_config),
