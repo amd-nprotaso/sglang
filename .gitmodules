@@ -1,0 +1,3 @@
+[submodule "agentx_benchmark/InferenceX"]
+	path = agentx_benchmark/InferenceX
+	url = git@github.com:SemiAnalysisAI/InferenceX.git
