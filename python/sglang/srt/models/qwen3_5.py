@@ -1483,7 +1483,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+        if (_is_xpu or _is_cpu) and self.attn_output_gate:
             return self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
