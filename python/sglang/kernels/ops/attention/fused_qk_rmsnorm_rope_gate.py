@@ -13,10 +13,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_hip_runtime
+
 
 def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
-    if not torch.cuda.is_available():
+    # ROCm reports gfx9xx as major 9 but has no PDL.
+    if not torch.cuda.is_available() or is_hip_runtime():
         return False
     try:
         major, _ = torch.cuda.get_device_capability()

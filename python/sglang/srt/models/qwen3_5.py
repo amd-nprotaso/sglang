@@ -237,7 +237,7 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
     return None
 
 
-if _is_cuda:
+if _is_cuda or _is_hip:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
     )
@@ -1481,12 +1481,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if _is_cuda and self.attn_output_gate:
+        if (_is_cuda or _is_hip) and self.attn_output_gate:
             return self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (_is_hip or _is_xpu or _is_cpu) and self.attn_output_gate:
+        if (_is_xpu or _is_cpu) and self.attn_output_gate:
             return self.forward_prepare_fused_gate(
                 positions=positions,
                 hidden_states=hidden_states,
