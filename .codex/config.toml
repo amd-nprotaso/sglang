@@ -1,0 +1,5 @@
+[projects."/var/home/my_sglang/qwen3_8_improvement/sglang"]
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-6.1-sol" = 2
