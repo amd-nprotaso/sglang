@@ -142,6 +142,8 @@ def gdn_prefill_qkv_prepare_kernel(
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    EPS: tl.constexpr,
+    NORMALIZE_QK: tl.constexpr,
 ):
     """Materialize strided Q/K/V into token-major tensors in one launch."""
     token_block = tl.program_id(0)
@@ -168,6 +170,9 @@ def gdn_prefill_qkv_prepare_kernel(
         )
         q_values = tl.load(q_block, boundary_check=(0, 1)).to(tl.float32)
         k_values = tl.load(k_block, boundary_check=(0, 1)).to(tl.float32)
+        if NORMALIZE_QK:
+            q_values = q_values / tl.sqrt(tl.sum(q_values * q_values, axis=1) + EPS)[:, None]
+            k_values = k_values / tl.sqrt(tl.sum(k_values * k_values, axis=1) + EPS)[:, None]
         q_output_block = tl.make_block_ptr(
             q_out + head_idx * D,
             (T, D),
@@ -221,8 +226,13 @@ def gdn_prefill_qkv_prepare_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     eps: float = 1e-6,
+    normalize_in_prepare: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Prepare Q/K/V for FlashInfer, materializing only strided inputs."""
+    """Prepare contiguous Q/K/V, optionally fusing Q/K normalization.
+
+    The default preserves the separate normalization kernels used by FlashInfer.
+    Fused normalization can differ by BF16 rounding from the separate kernels.
+    """
     if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
         raise ValueError(
             "GDN fused prepare requires equal Q/K [T, Hqk, D] shapes and "
@@ -243,7 +253,12 @@ def gdn_prefill_qkv_prepare_fwd(
     H_V = v.shape[1]
     if D > 512:
         raise ValueError(f"GDN fused prepare supports head dim <= 512, got {D}")
-    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+    if (
+        not normalize_in_prepare
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+    ):
         return l2norm_fwd(q, eps), l2norm_fwd(k, eps), v
 
     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
@@ -274,9 +289,13 @@ def gdn_prefill_qkv_prepare_fwd(
         D=D,
         BT=BT,
         BD=BD,
+        EPS=eps,
+        NORMALIZE_QK=normalize_in_prepare,
         num_warps=4,
         num_stages=2,
     )
+    if normalize_in_prepare:
+        return q_out, k_out, v_out
     return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
 
 

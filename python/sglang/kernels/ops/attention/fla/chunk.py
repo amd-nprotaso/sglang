@@ -14,13 +14,16 @@ from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.l2norm import gdn_prefill_qkv_prepare_fwd, l2norm_fwd
 from sglang.kernels.ops.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
     is_intel,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_gdn_fused_qkv_norm = is_hip() and get_bool_env_var("SGLANG_GDN_FUSED_QKV_NORM", "False")
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -251,6 +254,26 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    # Normalize while materializing strided inputs, before input_guard copies them.
+    if (
+        _gdn_fused_qkv_norm
+        and use_qk_l2norm_in_kernel
+        and q.ndim == 4
+        and q.shape[0] == 1
+        and k.shape == q.shape
+        and v.ndim == 4
+        and v.shape[0] == 1
+        and v.shape[1] == q.shape[1]
+        and v.shape[-1] == q.shape[-1]
+        and q.shape[-1] == 128
+        and q.dtype == k.dtype == v.dtype == torch.bfloat16
+        and q.shape[1] > 0
+    ):
+        q_p, k_p, v_p = gdn_prefill_qkv_prepare_fwd(
+            q[0], k[0], v[0], normalize_in_prepare=True
+        )
+        q, k, v = q_p.unsqueeze(0), k_p.unsqueeze(0), v_p.unsqueeze(0)
+        use_qk_l2norm_in_kernel = False
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

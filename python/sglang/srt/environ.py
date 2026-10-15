@@ -889,6 +889,11 @@ class Envs:
     # concurrency the grid is only num_seqs * num_kv_heads * splits CTAs, so a
     # larger value may be worth forcing.
     SGLANG_AITER_QSA_PA_DECODE_SPLITS = EnvInt(0)
+    # Serve QSA decode/verify on gfx950 with the fused FlyDSL kernel in
+    # sglang.kernels.ops.attention.qsa_flydsl: it reads the selected KV straight
+    # from the pool (no gather pass) and splits each row across CTAs, where the
+    # Triton fallback runs one program per (row, kv head). Other GPUs ignore it.
+    SGLANG_ENABLE_QSA_FLYDSL_DECODE = EnvBool(True)
     # Run GDN chunked prefill through AITER's opt_vk stages (fused FlyDSL prepare,
     # tuned hidden-state kernel) instead of the Triton FLA chunk path. Requires
     # SGLANG_USE_AITER. Measured on MI355X: 1.4x on the chunk stage, GSM8K unchanged.
