@@ -276,6 +276,12 @@ for _mod, _fn, _backend, _device in [
         KernelBackend.FLYDSL,
         CapabilityRequirement.HIP,
     ),
+    (
+        "qsa_flydsl.qsa_sparse_decode",
+        "flydsl_qsa_sparse_decode",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
 ]:
     register_kernel(
         KernelSpec(

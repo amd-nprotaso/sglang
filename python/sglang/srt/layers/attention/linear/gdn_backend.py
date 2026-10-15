@@ -43,7 +43,9 @@ if is_cuda() or is_hip() or is_xpu():
         fused_qkvzba_split_reshape_cat_contiguous,
     )
 
-MAX_FUSED_QKV_SPLIT_DIM = 8192
+_gdn_wide_qkv_split = _is_hip and get_bool_env_var("SGLANG_GDN_WIDE_QKV_SPLIT", "False")
+_gdn_fused_qkv_norm = _is_hip and get_bool_env_var("SGLANG_GDN_FUSED_QKV_NORM", "False")
+MAX_FUSED_QKV_SPLIT_DIM = 16384 if _gdn_wide_qkv_split else 8192
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -1089,6 +1091,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if (
             (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and (qkv_dim <= 8192 or mixed_qkv.stride(-1) == 1)
+            and not (
+                _gdn_fused_qkv_norm
+                and not is_target_verify
+                and mixed_qkv.dtype == torch.bfloat16
+                and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128
+            )
             and not self._use_strided_target_verify_qkv
         ):
             query, key, value = fused_qkv_split_gdn_prefill(
@@ -1335,7 +1344,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
 
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        if (
+            (is_cuda() or is_hip())
+            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
+            and (qkv_dim <= 8192 or mixed_qkv.stride(-1) == 1)
+        ):
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
