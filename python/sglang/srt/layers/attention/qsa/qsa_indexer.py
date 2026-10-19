@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
 from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.fp8_utils import PerTokenFp8Activation
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -161,7 +162,7 @@ class QSAIndexer(MultiPlatformOp):
 
     def project_qk(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PerTokenFp8Activation,
         positions: torch.Tensor,
         pool=None,
         cache_loc: torch.Tensor | None = None,
@@ -541,7 +542,7 @@ class QSAIndexer(MultiPlatformOp):
 
     def _forward_impl(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PerTokenFp8Activation,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
@@ -573,10 +574,15 @@ class QSAIndexer(MultiPlatformOp):
                 "QSA logical positions are shorter than the request mapping: "
                 f"positions={logical_positions.numel()}, mapping={num_valid_tokens}"
             )
-        if hidden_states.shape[0] < num_valid_tokens:
+        num_hidden_tokens = (
+            hidden_states.num_tokens
+            if isinstance(hidden_states, PerTokenFp8Activation)
+            else hidden_states.shape[0]
+        )
+        if num_hidden_tokens < num_valid_tokens:
             raise ValueError(
                 "QSA hidden states are shorter than the request mapping: "
-                f"hidden={hidden_states.shape[0]}, mapping={num_valid_tokens}"
+                f"hidden={num_hidden_tokens}, mapping={num_valid_tokens}"
             )
         position_tokens = (
             positions.shape[-1] if positions.ndim == 2 else positions.numel()
@@ -588,7 +594,11 @@ class QSAIndexer(MultiPlatformOp):
             )
 
         logical_positions = logical_positions[:num_valid_tokens]
-        hidden_states = hidden_states[:num_valid_tokens]
+        hidden_states = (
+            hidden_states.narrow_tokens(num_valid_tokens)
+            if isinstance(hidden_states, PerTokenFp8Activation)
+            else hidden_states[:num_valid_tokens]
+        )
         positions = (
             positions[:, :num_valid_tokens]
             if positions.ndim == 2
@@ -654,7 +664,7 @@ class QSAIndexer(MultiPlatformOp):
 
     def forward_cuda(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PerTokenFp8Activation,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
@@ -665,7 +675,7 @@ class QSAIndexer(MultiPlatformOp):
 
     def forward_xpu(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | PerTokenFp8Activation,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,

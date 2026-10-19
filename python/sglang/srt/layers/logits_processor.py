@@ -65,6 +65,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     is_cpu,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -478,6 +479,11 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.use_aiter_lm_head_gemm = (
+            envs.SGLANG_OPT_AITER_LM_HEAD_GEMM.get()
+            and envs.SGLANG_USE_AITER.get()
+            and is_hip()
+        )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -997,6 +1003,16 @@ class LogitsProcessor(nn.Module):
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
+                )
+            elif (
+                self.use_aiter_lm_head_gemm
+                and lm_head.weight.dtype == torch.bfloat16
+                and hidden_states.dtype == torch.bfloat16
+            ):
+                from aiter.tuned_gemm import tgemm
+
+                logits = tgemm.mm(
+                    inp=hidden_states, weights=lm_head.weight, otype=torch.bfloat16
                 )
             else:
                 logits = torch.matmul(

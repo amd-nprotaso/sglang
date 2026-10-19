@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from functools import lru_cache
@@ -199,12 +200,12 @@ def _aiter_topk_gating_renormalizes_softmax() -> bool:
         return False
 
 
-def _use_aiter_topk_gating_softmax(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: Optional[torch.Tensor],
-    num_fused_shared_experts: int,
-    packed_out: Optional[torch.Tensor],
+def _aiter_topk_gating_softmax_eligible(
+    *,
+    hidden_size: int,
+    hidden_dtype: torch.dtype,
+    num_routed_experts: int,
+    gating_dtype: torch.dtype,
 ) -> bool:
     # fused_topk has no ASM router for (512, 10); topk_gating has an E=512
     # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8) and 2560
@@ -213,16 +214,92 @@ def _use_aiter_topk_gating_softmax(
         _use_aiter
         and _use_aiter_topk_gating
         and _is_gfx95
-        and hidden_states.shape[1] in (2560, 8192)
-        and hidden_states.dtype == torch.bfloat16
-        and gating_output.shape[1] == 512
-        and gating_output.dtype == torch.bfloat16
-        and gating_output.is_contiguous()
+        and hidden_size in (2560, 8192)
+        and hidden_dtype == torch.bfloat16
+        and num_routed_experts == 512
+        and gating_dtype == torch.bfloat16
+        and _aiter_topk_gating_renormalizes_softmax()
+    )
+
+
+def _use_aiter_topk_gating_softmax(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    num_fused_shared_experts: int,
+    packed_out: Optional[torch.Tensor],
+) -> bool:
+    return (
+        gating_output.is_contiguous()
         and gating_output.shape[0] <= _AITER_TOPK_GATING_MAX_ROWS
         and correction_bias is None
         and num_fused_shared_experts == 0
         and packed_out is None
-        and _aiter_topk_gating_renormalizes_softmax()
+        and _aiter_topk_gating_softmax_eligible(
+            hidden_size=hidden_states.shape[1],
+            hidden_dtype=hidden_states.dtype,
+            num_routed_experts=gating_output.shape[1],
+            gating_dtype=gating_output.dtype,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
+def _aiter_topk_gating_writes_shared_slots() -> bool:
+    # aiter's HERD route (16 <= M <= 128) ignores num_shared_experts and would
+    # leave the shared weight column unwritten.
+    if os.environ.get("AITER_FLYDSL_USE_HERD", "0") == "1":
+        return False
+    try:
+        from aiter import topk_gating
+
+        return "num_shared_experts" in inspect.signature(topk_gating).parameters
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return False
+
+
+def aiter_topk_gating_with_shared_max_rows(
+    *,
+    hidden_size: int,
+    hidden_dtype: torch.dtype,
+    num_routed_experts: int,
+    gating_dtype: torch.dtype,
+) -> int:
+    # Within the bound the routed top-k runs fused_topk's kernel; 0 if unusable.
+    if not (
+        _aiter_topk_gating_softmax_eligible(
+            hidden_size=hidden_size,
+            hidden_dtype=hidden_dtype,
+            num_routed_experts=num_routed_experts,
+            gating_dtype=gating_dtype,
+        )
+        and _aiter_topk_gating_writes_shared_slots()
+    ):
+        return 0
+    return _AITER_TOPK_GATING_MAX_ROWS
+
+
+def aiter_topk_gating_with_shared(
+    *,
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_shared_experts: int,
+    renormalize: bool,
+) -> None:
+    # Shared weights are sigmoid(logit), unscaled; topk is topk_ids' width, and the
+    # shared id columns after it are never written, so the caller prefills them.
+    from aiter import topk_gating
+
+    topk_gating(
+        topk_weights=topk_weights,
+        topk_indices=topk_ids,
+        gating_output=gating_output,
+        correction_bias=None,
+        need_renorm=renormalize,
+        routed_scaling_factor=1.0,
+        score_func="softmax",
+        num_shared_experts=num_shared_experts,
     )
 
 

@@ -904,6 +904,12 @@ class Envs:
     # "fused" instead runs the whole chunked prefill as one FlyDSL kernel
     # (state kept on chip, l2norm and track snapshot in-kernel).
     SGLANG_AITER_GDN_PREFILL_H = EnvStr("triton")
+    # Fuse GDN's gated RMSNorm with out_proj's per-token FP8 quant (Quark FP8 out_proj);
+    # not bit-exact, it quantizes the fp32 norm output instead of its bf16 rounding.
+    SGLANG_OPT_QWEN4_FUSED_GDN_NORM_QUANT = EnvBool(False)
+    # Qwen4 QSA: per-token FP8-quantize hidden_states once for qkv_proj and the
+    # indexer's index_qk_proj (both Quark dynamic FP8); bit-exact.
+    SGLANG_OPT_QWEN4_SHARED_ATTN_QUANT = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
@@ -954,6 +960,12 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Route Qwen3.8's 512-expert softmax router through aiter `topk_gating`.
     SGLANG_ROCM_USE_AITER_TOPK_GATING = EnvBool(True)
+    # Fold shared_expert_gate into the router GEMM and let aiter topk_gating write
+    # the shared slot; not bit-exact (N=528 GEMM, sigmoid of a bf16 logit).
+    SGLANG_OPT_QWEN_MOE_FUSED_SHARED_TOPK = EnvBool(False)
+    # Unquantized BF16 lm_head through aiter tgemm, so its tuned rows apply;
+    # the default torch.matmul only sees hipBLASLt's heuristic.
+    SGLANG_OPT_AITER_LM_HEAD_GEMM = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the

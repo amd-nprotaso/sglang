@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 from torch.nn import Parameter
@@ -12,9 +12,12 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    PerTokenFp8Activation,
     apply_fp8_linear,
+    apply_fp8_linear_prequantized_per_token,
     cutlass_fp8_supported,
     normalize_e4m3fn_to_e4m3fnuz,
+    supports_prequantized_per_token_fp8_linear,
     use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
@@ -46,6 +49,12 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
             not self.is_static_input_scheme and self.input_qscheme == "per_channel"
         )
         self.out_dtype = torch.get_default_dtype()
+        # Dynamic per-token input implies layer.input_scale is None after loading.
+        self.accepts_prequantized_input = (
+            self.per_token
+            and self.weight_qscheme == "per_channel"
+            and supports_prequantized_per_token_fp8_linear(self.cutlass_fp8_supported)
+        )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -171,9 +180,21 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: Union[torch.Tensor, PerTokenFp8Activation],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if isinstance(x, PerTokenFp8Activation):
+            assert self.accepts_prequantized_input, (
+                "quark W8A8 FP8 linear received a pre-quantized per-token input "
+                "but is not a dynamic per-token, per-channel scheme."
+            )
+            return apply_fp8_linear_prequantized_per_token(
+                activation=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+                output_dtype=self.out_dtype,
+            )
         # Activations must be a plain bf16 tensor: per-channel FP8 (weight_scale
         # [N, 1]) is gated off the aiter fused RMSNorm+quant kernel upstream by
         # _is_block_scale_fp8, so the per-token quant happens in apply_fp8_linear.

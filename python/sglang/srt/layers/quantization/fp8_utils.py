@@ -5,6 +5,7 @@ from enum import Enum
 from functools import lru_cache, partial
 from typing import Callable, List, Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.gemm.fp8_kernel import (
@@ -2048,6 +2049,109 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     return _use_aiter and output_size % 64 == 0
 
 
+class PerTokenFp8Activation(msgspec.Struct, frozen=True):
+    """A linear input already quantized by dynamic per-token FP8 quantization."""
+
+    # [num_tokens, K], platform fp8 dtype (e4m3fn on gfx950, e4m3fnuz on gfx942).
+    data: torch.Tensor
+    # [num_tokens, 1] fp32; dequantized row i is data[i] * scale[i].
+    scale: torch.Tensor
+
+    @property
+    def num_tokens(self) -> int:
+        return self.data.shape[0]
+
+    def narrow_tokens(self, num_tokens: int) -> PerTokenFp8Activation:
+        return PerTokenFp8Activation(
+            data=self.data[:num_tokens], scale=self.scale[:num_tokens]
+        )
+
+
+def _dynamic_per_token_quant_fp8(
+    input_2d: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if _is_cuda:
+        return sglang_per_token_quant_fp8(input_2d)
+    return per_token_group_quant_fp8(input_2d, group_size=input_2d.shape[1])
+
+
+def quantize_per_token_fp8_activation(x: torch.Tensor) -> PerTokenFp8Activation:
+    """Quantize ``x`` as apply_fp8_linear does for a dynamic per-token input."""
+    qinput, x_scale = _dynamic_per_token_quant_fp8(x.view(-1, x.shape[-1]))
+    return PerTokenFp8Activation(data=qinput, scale=x_scale)
+
+
+def supports_prequantized_per_token_fp8_linear(cutlass_fp8_supported: bool) -> bool:
+    """Whether a dynamic per-token, per-channel-weight linear takes the rowwise GEMM."""
+    return not cutlass_fp8_supported and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+
+
+def _rowwise_per_token_fp8_gemm(
+    qinput: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+):
+    # Must agree with the load-time predicate that decides whether the
+    # weight was pre-shuffled; an unshuffled weight through the aiter path
+    # (or a shuffled one through torch._scaled_mm) silently returns garbage.
+    if use_aiter_bpreshuffle_gemm(weight.shape[1]):
+        # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
+        # XQ -> input tensor, shape = (m, k)
+        # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf
+        # x_scale -> input scale tensor, shape = (m, 1)
+        # w_scale -> weight scale tensor, shape = (n ,1)
+        # dtype -> output dtype
+        output = gemm_a8w8_bpreshuffle(
+            XQ=qinput,
+            WQ=weight.T,
+            x_scale=x_scale,
+            w_scale=weight_scale,
+            dtype=output_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return output
+    # For now validated on ROCm platform
+    # fp8 rowwise scaling in torch._scaled_mm is introduced in
+    # https://github.com/pytorch/pytorch/pull/144432 using hipBLASLt
+    # and ROCm 6.3, which only exists in torch 2.7 and above.
+    # For CUDA platform please validate if the
+    # torch._scaled_mm support rowwise scaled GEMM
+    # Fused GEMM_DQ Rowwise GEMM
+    return torch._scaled_mm(
+        qinput,
+        weight,
+        out_dtype=output_dtype,
+        scale_a=x_scale,
+        scale_b=weight_scale.t(),
+        bias=bias,
+    )
+
+
+def apply_fp8_linear_prequantized_per_token(
+    activation: PerTokenFp8Activation,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """The GEMM half of apply_fp8_linear; weight [K, N], per-channel scale [N, 1]."""
+    output = _rowwise_per_token_fp8_gemm(
+        qinput=activation.data,
+        x_scale=activation.scale,
+        weight=weight,
+        weight_scale=weight_scale,
+        bias=bias,
+        output_dtype=output_dtype,
+    )
+    return _process_scaled_mm_output(
+        output, activation.data.shape, [activation.num_tokens, weight.shape[1]]
+    )
+
+
 def apply_fp8_linear_bmm_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2181,22 +2285,17 @@ def apply_fp8_linear(
             )
         else:
             # default use per-token quantization if dynamic
-            if _is_cuda:
-                qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+            # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+            # final solution should be: 1. add support to per-tensor activation scaling.
+            # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+            if _is_hip and weight_scale.numel() == 1:
+                qinput, x_scale = scaled_fp8_quant(
+                    input_2d,
+                    input_scale,
+                    use_per_token_if_dynamic=use_per_token_if_dynamic,
+                )
             else:
-                # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
-                # final solution should be: 1. add support to per-tensor activation scaling.
-                # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
-                if _is_hip and weight_scale.numel() == 1:
-                    qinput, x_scale = scaled_fp8_quant(
-                        input_2d,
-                        input_scale,
-                        use_per_token_if_dynamic=use_per_token_if_dynamic,
-                    )
-                else:
-                    qinput, x_scale = per_token_group_quant_fp8(
-                        input_2d, group_size=input_2d.shape[1]
-                    )
+                qinput, x_scale = _dynamic_per_token_quant_fp8(input_2d)
 
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
@@ -2258,43 +2357,15 @@ def apply_fp8_linear(
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
         # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
-        # Must agree with the load-time predicate that decides whether the
-        # weight was pre-shuffled; an unshuffled weight through the aiter path
-        # (or a shuffled one through torch._scaled_mm) silently returns garbage.
-        if use_aiter_bpreshuffle_gemm(weight.shape[1]):
-            # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
-            # XQ -> input tensor, shape = (m, k)
-            # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf
-            # x_scale -> input scale tensor, shape = (m, 1)
-            # w_scale -> weight scale tensor, shape = (n ,1)
-            # dtype -> output dtype
-            output = gemm_a8w8_bpreshuffle(
-                XQ=qinput,
-                WQ=weight.T,
-                x_scale=x_scale,
-                w_scale=weight_scale,
-                dtype=output_dtype,
-            )
-            if bias is not None:
-                output += bias
-            return _process_scaled_mm_output(output, input_2d.shape, output_shape)
-        else:
-            # For now validated on ROCm platform
-            # fp8 rowwise scaling in torch._scaled_mm is introduced in
-            # https://github.com/pytorch/pytorch/pull/144432 using hipBLASLt
-            # and ROCm 6.3, which only exists in torch 2.7 and above.
-            # For CUDA platform please validate if the
-            # torch._scaled_mm support rowwise scaled GEMM
-            # Fused GEMM_DQ Rowwise GEMM
-            output = torch._scaled_mm(
-                qinput,
-                weight,
-                out_dtype=output_dtype,
-                scale_a=x_scale,
-                scale_b=weight_scale.t(),
-                bias=bias,
-            )
-            return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+        output = _rowwise_per_token_fp8_gemm(
+            qinput=qinput,
+            x_scale=x_scale,
+            weight=weight,
+            weight_scale=weight_scale,
+            bias=bias,
+            output_dtype=output_dtype,
+        )
+        return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
     if per_tensor_weights and per_tensor_activations:
         # Fused GEMM_DQ; _scaled_mm with torch.compile requires len(weight_scale.shape) == len(x_scale.shape)

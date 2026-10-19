@@ -64,11 +64,18 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutputChecker,
+    aiter_topk_gating_with_shared,
+    aiter_topk_gating_with_shared_max_rows,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -93,11 +100,17 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
+    get_spec,
     get_stream,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
     add_prefix,
@@ -108,6 +121,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     make_layers,
+    round_up,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -255,6 +269,113 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+# Rows of the fused router weight (routed + 1 shared) are padded to a multiple of
+# 16 so the bf16 logit row stride stays 32B-aligned for hipBLASLt and for the
+# 16B vector loads in aiter topk_gating. 528 for 512 experts; not tuned.
+_FUSED_SHARED_GATE_ROW_ALIGN = 16
+
+
+# Largest captured decode/verify M; larger (prefill) batches keep the append path.
+def _fused_shared_router_max_rows() -> int:
+    cg_config = get_exec().graph.cuda_graph_config
+    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
+    tokens_per_req = (
+        (max_speculative_num_draft_tokens() or 1)
+        if get_spec().speculative_algorithm
+        else 1
+    )
+    return decode_max_bs * tokens_per_req
+
+
+def _warn_fused_shared_router_off(reason: str) -> None:
+    logger.warning_once(f"SGLANG_OPT_QWEN_MOE_FUSED_SHARED_TOPK ignored: {reason}.")
+
+
+# One GEMM over [gate.weight; shared_expert_gate.weight; 0] yields the routed
+# logits and the shared logit; aiter topk_gating then writes the shared slot.
+class _QwenFusedSharedRouter:
+    def __init__(
+        self,
+        *,
+        gate: nn.Module,
+        shared_expert_gate: nn.Module,
+        top_k: int,
+        renormalize: bool,
+        max_rows: int,
+    ):
+        from aiter.tuned_gemm import tgemm
+
+        self._gemm = tgemm.mm
+        self._gate = gate
+        self._shared_expert_gate = shared_expert_gate
+        self.top_k = top_k
+        self.renormalize = renormalize
+        self.max_rows = max_rows
+
+        gate_weight = gate.weight
+        self.num_routed_experts, hidden_size = gate_weight.shape
+        num_rows = round_up(self.num_routed_experts + 1, _FUSED_SHARED_GATE_ROW_ALIGN)
+        self.gate_ext = torch.zeros(
+            (num_rows, hidden_size),
+            dtype=gate_weight.dtype,
+            device=gate_weight.device,
+        )
+        routed_rows = self.gate_ext[: self.num_routed_experts]
+        shared_row = self.gate_ext[
+            self.num_routed_experts : self.num_routed_experts + 1
+        ]
+        routed_rows.copy_(gate_weight.data)
+        shared_row.copy_(shared_expert_gate.weight.data)
+        # Both module weights become views of gate_ext, so checkpoint loads and
+        # in-place weight updates refresh gate_ext without a post-load hook.
+        gate_weight.data = routed_rows
+        shared_expert_gate.weight.data = shared_row
+        self._shared_row_ptr = shared_row.data_ptr()
+
+        # Persistent so CUDA graphs capture fixed addresses. Column top_k holds
+        # the shared expert id (num_routed_experts); topk_gating only writes
+        # its weight, so the id is filled once here.
+        self.topk_ids_buf = torch.full(
+            (max_rows, top_k + 1),
+            self.num_routed_experts,
+            dtype=torch.int32,
+            device=gate_weight.device,
+        )
+        self.topk_weights_buf = torch.zeros(
+            (max_rows, top_k + 1), dtype=torch.float32, device=gate_weight.device
+        )
+
+    def weights_aliased(self) -> bool:
+        # A load path that rebinds parameter storage (e.g. meta init + to_empty)
+        # leaves gate_ext stale; callers then use the unfused router.
+        return (
+            self._gate.weight.data_ptr() == self.gate_ext.data_ptr()
+            and self._shared_expert_gate.weight.data_ptr() == self._shared_row_ptr
+        )
+
+    def route(self, hidden_states: torch.Tensor) -> StandardTopKOutput:
+        num_tokens = hidden_states.shape[0]
+        num_routed = self.num_routed_experts
+        # [M, padded_rows] bf16; columns >= num_routed + 1 are zero padding.
+        logits = self._gemm(
+            inp=hidden_states, weights=self.gate_ext, otype=hidden_states.dtype
+        )
+        topk_weights = self.topk_weights_buf[:num_tokens]
+        topk_ids = self.topk_ids_buf[:num_tokens]
+        aiter_topk_gating_with_shared(
+            gating_output=logits[:, : num_routed + 1],
+            topk_weights=topk_weights,
+            topk_ids=topk_ids[:, : self.top_k],
+            num_shared_experts=1,
+            renormalize=self.renormalize,
+        )
+        return StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=logits[:, :num_routed],
+        )
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -388,6 +509,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        self._fused_shared_router = self._init_fused_shared_router(config)
 
         if (
             get_moe_a2a_backend().is_deepep()
@@ -405,6 +527,87 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._mega_top_k = config.num_experts_per_tok + self.num_fused_shared_experts
         self._mega_intermediate_size = config.moe_intermediate_size
         self._mega_hidden_size = config.hidden_size
+
+    def _init_fused_shared_router(
+        self, config: PretrainedConfig
+    ) -> Optional[_QwenFusedSharedRouter]:
+        if not envs.SGLANG_OPT_QWEN_MOE_FUSED_SHARED_TOPK.get():
+            return None
+        if not (_use_aiter and self.enable_shared_expert_fusion):
+            _warn_fused_shared_router_off("needs aiter with shared-expert fusion")
+            return None
+        moe = get_exec().moe
+        # Every excluded feature rewrites or observes the routed ids between
+        # top-k and the experts, which this router skips (see select_experts).
+        if (
+            self.num_fused_shared_experts != 1
+            # The shared weight would need the 1/ep_size pre-scale.
+            or get_parallel().moe_ep_size != 1
+            or not get_moe_a2a_backend().is_none()
+            or not (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_aiter()
+            )
+            or moe.enable_eplb
+            or moe.init_expert_location != "trivial"
+            or moe.ep_num_redundant_experts > 0
+            or moe.expert_distribution_recorder_mode is not None
+            or get_exec().features.enable_return_routed_experts
+            or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            or self.topk.topk_config.output_format is not None
+            or self.shared_expert_gate.weight.dtype != self.gate.weight.dtype
+            # Meta-device init materializes each weight separately, breaking the alias.
+            or self.gate.weight.device.type == "meta"
+            # The shared-id column of topk_ids_buf is written once and lives in the
+            # weights region, so a weights release/resume would leave it undefined.
+            or get_exec().features.enable_memory_saver
+            # A split-prefill forward and a decode graph replay would race on
+            # the per-layer topk buffers.
+            or get_disagg().enable_pdmux
+        ):
+            _warn_fused_shared_router_off("an incompatible feature is enabled")
+            return None
+        max_rows = min(
+            _fused_shared_router_max_rows(),
+            aiter_topk_gating_with_shared_max_rows(
+                hidden_size=config.hidden_size,
+                hidden_dtype=self.gate.weight.dtype,
+                num_routed_experts=config.num_experts,
+                gating_dtype=self.gate.weight.dtype,
+            ),
+        )
+        if max_rows <= 0:
+            _warn_fused_shared_router_off(
+                "no captured decode CUDA graph or unsupported aiter topk_gating"
+            )
+            return None
+        return _QwenFusedSharedRouter(
+            gate=self.gate,
+            shared_expert_gate=self.shared_expert_gate,
+            top_k=config.num_experts_per_tok,
+            renormalize=config.norm_topk_prob,
+            max_rows=max_rows,
+        )
+
+    def _use_fused_shared_router(self, hidden_states: torch.Tensor) -> bool:
+        router = self._fused_shared_router
+        if router is None or hidden_states.shape[0] > router.max_rows:
+            return False
+        # The unfused TopK swaps to its torch-native forward under torch.compile.
+        if (
+            self.topk.is_torch_compile
+            or torch.compiler.is_compiling()
+            or is_in_tc_piecewise_cuda_graph()
+        ):
+            return False
+        if not router.weights_aliased():
+            logger.warning_once(
+                "Qwen fused shared-expert router disabled: gate weights were "
+                "re-allocated after construction, so the fused gate is stale."
+            )
+            return False
+        return True
 
     def get_moe_weights(self):
         return [
@@ -711,6 +914,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         *,
         defer_finalize: bool = False,
     ):
+        if not defer_finalize and self._use_fused_shared_router(hidden_states):
+            topk_output = self._fused_shared_router.route(hidden_states)
+            return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)

@@ -1115,6 +1115,19 @@ class QuarkLinearMethod(LinearMethodBase):
         return scheme.apply_weights(layer, x, bias=bias)
 
 
+def accepts_prequantized_per_token_input(layer: torch.nn.Module) -> bool:
+    from sglang.srt.runtime_context import get_lora
+
+    # LoRA wraps the Linear after model init and its A/B GEMMs need the bf16 input.
+    if get_lora().enable_lora or get_lora().lora_paths:
+        return False
+    return (
+        isinstance(layer.quant_method, QuarkLinearMethod)
+        and isinstance(layer.scheme, QuarkW8A8Fp8)
+        and layer.scheme.accepts_prequantized_input
+    )
+
+
 class QuarkFusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quantization_config: QuarkConfig):
         self.quantization_config = quantization_config

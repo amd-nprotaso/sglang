@@ -43,8 +43,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import (
+    PerTokenFp8Activation,
+    quantize_per_token_fp8_activation,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
+)
+from sglang.srt.layers.quantization.quark.quark import (
+    accepts_prequantized_per_token_input,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -1568,11 +1575,17 @@ class Qwen4ExpAttentionDecoderLayer(
                 prefix=f"{prefix}.indexer" if prefix else "indexer",
                 rotary_emb=self.rotary_emb,
             )
+        self.share_attn_input_quant = (
+            self.is_qsa
+            and envs.SGLANG_OPT_QWEN4_SHARED_ATTN_QUANT.get()
+            and accepts_prequantized_per_token_input(self.qkv_proj)
+            and accepts_prequantized_per_token_input(self.indexer.index_qk_proj)
+        )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
 
     def _compute_qsa_topk_indices(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, PerTokenFp8Activation],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
@@ -1621,6 +1634,9 @@ class Qwen4ExpAttentionDecoderLayer(
             and hidden_states.shape[0] < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD
         )
         attention_kwargs = {}
+        if self.share_attn_input_quant and not torch.compiler.is_compiling():
+            # qkv_proj and indexer.index_qk_proj would each quantize the same rows.
+            hidden_states = quantize_per_token_fp8_activation(hidden_states)
         if overlap_indexer:
             # Safe to overlap: the indexer reads only hidden_states/positions,
             # and writes QSA-private pool buffers.
