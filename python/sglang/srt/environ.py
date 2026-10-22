@@ -878,6 +878,10 @@ class Envs:
     # one CTA streams well inside a single launch. Default ON elsewhere, where
     # launches are cheaper and the split was tuned.
     SGLANG_HC_COMBINE_SPLIT = EnvBool(lambda: not _default_hip())
+    # Fuse hc_combine with the next sublayer's HC norm (one kernel, no re-read of the
+    # combined row). Measured on gfx950 only, so default ON for ROCm/HIP and OFF
+    # elsewhere, where the split combine + norm pair stays.
+    SGLANG_ENABLE_HC_COMBINE_NORM_FUSION = EnvBool(lambda: _default_hip())
     # Serve the post-gather QSA attention with AITER's FlyDSL BF16 paged decode
     # instead of the CK varlen fallback. CK runs a prefill-shaped kernel here: its
     # TileFmhaShape puts only seqlen_q on the MFMA M axis, so a length-one decode

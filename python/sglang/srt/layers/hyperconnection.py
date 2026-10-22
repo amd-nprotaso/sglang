@@ -191,6 +191,9 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            self._fused_combine_norm_ok = (
+                envs.SGLANG_ENABLE_HC_COMBINE_NORM_FUSION.get() and self._jit_combine_ok
+            )
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -239,7 +242,20 @@ class GatedResidual(HyperConnectionBase):
             )
         return self._mix_flydsl_ok
 
-    def mix(self, hyper_input: torch.Tensor):
+    def _norm(self, hyper_input: torch.Tensor) -> torch.Tensor:
+        if self.config.hc_per_branch_norm:
+            return self.hc_norm(hyper_input)
+        return self.hc_norm(
+            hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+        ).flatten(-2)
+
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: Optional[torch.Tensor] = None,
+    ):
+        """``hyper_input_normed`` is this module's norm of ``hyper_input`` when the
+        caller already has it (see ``combine_and_norm``)."""
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -247,12 +263,8 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input)
 
-        if self.config.hc_per_branch_norm:
-            hyper_input_normed = self.hc_norm(hyper_input)
-        else:
-            hyper_input_normed = self.hc_norm(
-                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
-            ).flatten(-2)
+        if hyper_input_normed is None:
+            hyper_input_normed = self._norm(hyper_input)
         if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
@@ -309,6 +321,54 @@ class GatedResidual(HyperConnectionBase):
             ).to(self.params_dtype)
         return mixed_input, (hyper_input, hyper_input_normed)
 
+    def _jit_combine_eligible(
+        self,
+        block_output: torch.Tensor,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: torch.Tensor,
+    ) -> bool:
+        return (
+            self._jit_combine_ok
+            and block_output.is_cuda
+            and block_output.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input.dtype == block_output.dtype
+            and hyper_input_normed.dtype == block_output.dtype
+            and self.block_inject_weight.weight.dtype == block_output.dtype
+        )
+
+    def combine_and_norm(
+        self, block_output: torch.Tensor, residuals, next_hc: "GatedResidual"
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """``combine`` followed by ``next_hc``'s input norm, for ``next_hc.mix``.
+
+        Returns ``(combined, combined_normed)``; ``combined_normed`` is None when
+        no fused kernel applies and ``next_hc.mix`` must norm on its own.
+        """
+        hyper_input, hyper_input_normed = residuals
+        if (
+            self._fused_combine_norm_ok
+            and next_hc.config.hc_per_branch_norm
+            and next_hc.hc_count == self.hc_count
+            and block_output.shape[0] > 0
+            and next_hc.hc_norm.weight.dtype == block_output.dtype
+            and self._jit_combine_eligible(
+                block_output, hyper_input, hyper_input_normed
+            )
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine import hc_combine_norm
+
+            return hc_combine_norm(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                next_hc.hc_norm.weight,
+                self.hc_count,
+                self.hidden_size,
+                next_hc.hc_norm.variance_epsilon,
+            )
+        return self.combine(block_output, residuals), None
+
     def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
         hyper_input, hyper_input_normed = residuals
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
@@ -316,14 +376,7 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
-        if (
-            self._jit_combine_ok
-            and block_output.is_cuda
-            and block_output.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input.dtype == block_output.dtype
-            and hyper_input_normed.dtype == block_output.dtype
-            and self.block_inject_weight.weight.dtype == block_output.dtype
-        ):
+        if self._jit_combine_eligible(block_output, hyper_input, hyper_input_normed):
             if self._split_combine_ok and block_output.shape[0] <= 32:
                 from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_split,
