@@ -870,6 +870,9 @@ class Envs:
     SGLANG_USE_AITER = EnvBool(False)
     # Use gfx950 BF16 Qwen HC mix when AITER FlyDSL hc_mix is available.
     SGLANG_AITER_HC_MIX = EnvBool(True)
+    # Decode-sized (<= 128 rows) HC sites on gfx950: per-branch norm and the combine's inject
+    # GEMV folded into FlyDSL HC mix kernels; the combine becomes elementwise.
+    SGLANG_OPT_QWEN4_FUSED_HC = EnvBool(False)
     # Split hc_combine into a gate + apply pair. The split buys small-M rows more
     # CTAs than the one-CTA-per-row fused kernel, at the price of a second
     # dispatch. Default OFF for ROCm/HIP, where that dispatch is the whole cost:
