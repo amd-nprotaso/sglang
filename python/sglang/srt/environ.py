@@ -1001,6 +1001,9 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Decode-sized (<= 128 rows) HC sites on gfx950: per-branch norm and the combine's inject
+    # GEMV folded into FlyDSL HC mix kernels; the combine becomes elementwise.
+    SGLANG_OPT_QWEN4_FUSED_HC = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
