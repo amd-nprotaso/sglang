@@ -181,8 +181,13 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+# Packed GEMM remains opt-in: it did not improve the Qwen3.8 C8 benchmark.
+_gdn_packed_qwen4 = _use_aiter and get_bool_env_var("SGLANG_GDN_PACKED_QWEN4", "False")
+_gdn_hip_prefill_views = _use_aiter and get_bool_env_var(
+    "SGLANG_GDN_HIP_PREFILL_VIEWS", "False"
+)
 _gdn_decode_fused_proj_conv = (
-    _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
+    (_is_cuda or _is_hip) and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
 _gdn_online_mxfp4 = (
     ("in_proj_qkvz", "out_proj")
@@ -726,6 +731,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if (
             _use_aiter
             and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
+            and not (_gdn_packed_qwen4 and self.config.model_type == "qwen4_exp_text")
         ):
             return
         if get_lora().enable_lora or get_lora().lora_paths:
@@ -1056,7 +1062,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # The strided views feed only prefill GDN; DP-relabeled decode rows
             # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda
+                (_is_cuda or _gdn_hip_prefill_views)
                 and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
@@ -1897,7 +1903,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+        if _use_aiter and (
+            self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
+            or (_gdn_packed_qwen4 and self.config.model_type == "qwen4_exp_text")
+        ):
             packed = 0
             mxfp4 = 0
             for module in self.modules():
