@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -193,6 +194,9 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            self._fused_combine_norm_ok = (
+                envs.SGLANG_ENABLE_HC_COMBINE_NORM_FUSION.get() and self._jit_combine_ok
+            )
             if (
                 self.hc_count == 4
                 and self.hidden_size == 2560
@@ -378,7 +382,46 @@ class GatedResidual(HyperConnectionBase):
                 next_norm.weight,
                 next_norm.variance_epsilon,
             )
+        hyper_input_normed = residuals[1]
+        if (
+            self._fused_combine_norm_ok
+            and next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.numel() == self.hc_count * self.hidden_size
+            and next_norm.weight.dtype == block_output.dtype
+            and block_output.shape[0] > 0
+            and self._jit_combine_eligible(
+                block_output, hyper_input, hyper_input_normed
+            )
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine import hc_combine_norm
+
+            return hc_combine_norm(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                next_norm.weight,
+                self.hc_count,
+                self.hidden_size,
+                next_norm.variance_epsilon,
+            )
         return self.combine(block_output, residuals), None
+
+    def _jit_combine_eligible(
+        self,
+        block_output: torch.Tensor,
+        hyper_input: torch.Tensor,
+        hyper_input_normed: torch.Tensor,
+    ) -> bool:
+        return (
+            self._jit_combine_ok
+            and block_output.is_cuda
+            and block_output.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input.dtype == block_output.dtype
+            and hyper_input_normed.dtype == block_output.dtype
+            and self.block_inject_weight.weight.dtype == block_output.dtype
+        )
 
     def combine(
         self,
@@ -400,14 +443,7 @@ class GatedResidual(HyperConnectionBase):
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
 
-        if (
-            self._jit_combine_ok
-            and block_output.is_cuda
-            and block_output.dtype in (torch.bfloat16, torch.float16)
-            and hyper_input.dtype == block_output.dtype
-            and hyper_input_normed.dtype == block_output.dtype
-            and self.block_inject_weight.weight.dtype == block_output.dtype
-        ):
+        if self._jit_combine_eligible(block_output, hyper_input, hyper_input_normed):
             if self._split_combine_ok and block_output.shape[0] <= 32:
                 from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_split,

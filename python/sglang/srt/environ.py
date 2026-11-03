@@ -1001,6 +1001,10 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Fuse hc_combine with the next sublayer's HC norm (one kernel, no re-read of the
+    # combined row). Measured on gfx950 only, so default ON for ROCm/HIP and OFF
+    # elsewhere, where the split combine + norm pair stays.
+    SGLANG_ENABLE_HC_COMBINE_NORM_FUSION = EnvBool(lambda: _default_hip())
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
