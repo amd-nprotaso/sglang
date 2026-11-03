@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -189,7 +190,8 @@ class GatedResidual(HyperConnectionBase):
             )
             vecs = self.hc_count * self.hidden_size // 8
             self._split_combine_ok = (
-                self._jit_combine_ok
+                envs.SGLANG_HC_COMBINE_SPLIT.get()
+                and self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )

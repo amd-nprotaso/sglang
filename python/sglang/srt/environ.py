@@ -1021,6 +1021,14 @@ class Envs:
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # Split hc_combine into a gate + apply pair. The split buys small-M rows more
+    # CTAs than the one-CTA-per-row fused kernel, at the price of a second
+    # dispatch. Default OFF for ROCm/HIP, where that dispatch is the whole cost:
+    # profiling Qwen decode on gfx950 put both halves at the ~4.2us floor every
+    # launch-bound kernel in the trace sits at, so the pair spent 8.3us on work
+    # one CTA streams well inside a single launch. Default ON elsewhere, where
+    # launches are cheaper and the split was tuned.
+    SGLANG_HC_COMBINE_SPLIT = EnvBool(lambda: not _default_hip())
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
