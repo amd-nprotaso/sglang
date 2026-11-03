@@ -1025,6 +1025,12 @@ class Envs:
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    # Fuse GDN's gated RMSNorm with out_proj's per-token FP8 quant (Quark FP8 out_proj);
+    # not bit-exact, it quantizes the fp32 norm output instead of its bf16 rounding.
+    SGLANG_OPT_QWEN4_FUSED_GDN_NORM_QUANT = EnvBool(False)
+    # Qwen4 QSA: per-token FP8-quantize hidden_states once for qkv_proj and the
+    # indexer's index_qk_proj (both Quark dynamic FP8); bit-exact.
+    SGLANG_OPT_QWEN4_SHARED_ATTN_QUANT = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
@@ -1100,6 +1106,12 @@ class Envs:
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
+    # Fold shared_expert_gate into the router GEMM and let aiter topk_gating write
+    # the shared slot; not bit-exact (N=528 GEMM, sigmoid of a bf16 logit).
+    SGLANG_OPT_QWEN_MOE_FUSED_SHARED_TOPK = EnvBool(False)
+    # Unquantized BF16 lm_head through aiter tgemm, so its tuned rows apply;
+    # the default torch.matmul only sees hipBLASLt's heuristic.
+    SGLANG_OPT_AITER_LM_HEAD_GEMM = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the

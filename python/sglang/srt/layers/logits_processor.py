@@ -565,6 +565,11 @@ class LogitsProcessor(nn.Module):
         )
         self._aux_hidden_states_checked = False
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.use_aiter_lm_head_gemm = (
+            envs.SGLANG_OPT_AITER_LM_HEAD_GEMM.get()
+            and envs.SGLANG_USE_AITER.get()
+            and is_hip()
+        )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -1249,6 +1254,16 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif (
+                self.use_aiter_lm_head_gemm
+                and lm_head.weight.dtype == torch.bfloat16
+                and hidden_states.dtype == torch.bfloat16
+            ):
+                from aiter.tuned_gemm import tgemm
+
+                logits = tgemm.mm(
+                    inp=hidden_states, weights=lm_head.weight, otype=torch.bfloat16
+                )
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

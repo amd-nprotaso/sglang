@@ -95,6 +95,10 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import PerTokenFp8Activation
+from sglang.srt.layers.quantization.quark.quark import (
+    accepts_prequantized_per_token_input,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -147,6 +151,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -184,11 +189,25 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+# fp8_utils keeps aiter off on gfx1250
+_gdn_fused_norm_quant = (
+    _use_aiter
+    and not is_gfx1250_supported()
+    and envs.SGLANG_OPT_QWEN4_FUSED_GDN_NORM_QUANT.get()
+)
 _gdn_online_mxfp4 = (
     ("in_proj_qkvz", "out_proj")
     if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
     else ()
 )
+if _gdn_fused_norm_quant:
+    from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
+        gated_rmsnorm_fp8_per_token_quant,
+    )
+
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+# RMSNormGated activation -> use_sigmoid of the aiter op; it only has these gates.
+_GATED_NORM_QUANT_USE_SIGMOID = {"swish": False, "silu": False, "sigmoid": True}
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -357,6 +376,25 @@ if _is_npu:
     )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
+    )
+
+
+def _supports_fused_gated_norm_quant(
+    norm: RMSNormGated,
+    out_proj: RowParallelLinear,
+    num_heads_per_rank: int,
+    head_dim: int,
+) -> bool:
+    # Limits of aiter gated_rmsnorm_fp8_per_token_quant; it reads the norm
+    # weight with the input dtype, and bf16 is the only input we feed it.
+    return (
+        norm.norm_before_gate
+        and norm.group_size is None
+        and norm.activation in _GATED_NORM_QUANT_USE_SIGMOID
+        and norm.weight.dtype == torch.bfloat16
+        and head_dim == 128
+        and num_heads_per_rank <= 128
+        and accepts_prequantized_per_token_input(out_proj)
     )
 
 
@@ -531,6 +569,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             quant_config=quant_config,
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
+        )
+        self.fuse_norm_quant = _gdn_fused_norm_quant and (
+            _supports_fused_gated_norm_quant(
+                norm=self.norm,
+                out_proj=self.out_proj,
+                num_heads_per_rank=self.num_v_heads // self.attn_tp_size,
+                head_dim=self.head_v_dim,
+            )
         )
 
         if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
@@ -1115,6 +1161,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        if (
+            self.fuse_norm_quant
+            and core_attn_out.shape[0] > 0
+            and not torch.compiler.is_compiling()
+        ):
+            output, _ = self.out_proj(
+                self._fused_gated_norm_quant(
+                    core_attn_out=core_attn_out, z=z, z_shape_og=z_shape_og
+                )
+            )
+            return output
         nv = self.num_v_heads // self.attn_tp_size
         if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
             fp8, _, _ = _layer_norm_fwd(
@@ -1138,6 +1195,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _fused_gated_norm_quant(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+        z_shape_og: torch.Size,
+    ) -> PerTokenFp8Activation:
+        num_heads, head_dim = z_shape_og[-2], z_shape_og[-1]
+        # The op takes [num_tokens, num_heads, head_dim] with unit stride on
+        # head_dim only, so the strided prefill z view is passed as is.
+        x = core_attn_out.view(-1, num_heads, head_dim)
+        gate = z.view(-1, num_heads, head_dim)
+        num_tokens = x.shape[0]
+        data = torch.empty(
+            (num_tokens, num_heads * head_dim), dtype=fp8_dtype, device=x.device
+        )
+        # The op writes one fp32 per token; [num_tokens, 1] keeps the GEMM layout.
+        scale = torch.empty((num_tokens, 1), dtype=torch.float32, device=x.device)
+        gated_rmsnorm_fp8_per_token_quant(
+            out=data,
+            scale=scale,
+            x=x,
+            z=gate,
+            weight=self.norm.weight,
+            epsilon=self.norm.eps,
+            use_sigmoid=_GATED_NORM_QUANT_USE_SIGMOID[self.norm.activation],
+        )
+        return PerTokenFp8Activation(data=data, scale=scale)
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
@@ -1505,7 +1590,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
-        seq_len = hidden_states.shape[0]
+        # qkv, not hidden_states: the latter may be a PerTokenFp8Activation.
+        seq_len = qkv.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
@@ -1612,7 +1698,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def _prepare_qkv_gate(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, PerTokenFp8Activation],
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if _is_cuda and self.attn_output_gate:
