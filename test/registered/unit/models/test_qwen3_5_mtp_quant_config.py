@@ -1,4 +1,9 @@
+import tempfile
 import unittest
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
 
 from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
@@ -43,6 +48,93 @@ class _FakeQuantConfig:
 
 
 class TestQwen3_5MTPQuantConfig(CustomTestCase):
+    def _resolve_checkpoint(self, shards):
+        quant_config = _FakeQuantConfig("quark", _MIXED_EXCLUDES)
+        with tempfile.TemporaryDirectory() as directory:
+            files = []
+            for i, tensors in enumerate(shards):
+                filename = str(Path(directory) / f"shard-{i}.safetensors")
+                save_file(tensors, filename)
+                files.append(filename)
+            resolved = Qwen3_5ForCausalLMMTP.resolve_checkpoint_quantization(
+                quant_config, files
+            )
+        return quant_config, resolved
+
+    def test_explicit_online_quantization_does_not_probe_checkpoint(self):
+        quant_config = _FakeQuantConfig("quark", _MIXED_EXCLUDES)
+        quant_config.online_scheme = "quark_mxfp4"
+        self.assertIs(
+            Qwen3_5ForCausalLMMTP.resolve_checkpoint_quantization(
+                quant_config, ["must-not-be-opened.safetensors"]
+            ),
+            quant_config,
+        )
+
+    def test_bf16_mtp_without_expert_excludes(self):
+        _, resolved = self._resolve_checkpoint(
+            [
+                {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(
+                        4, 2, dtype=torch.uint8
+                    )
+                },
+                {
+                    "mtp.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(
+                        4, 4, dtype=torch.bfloat16
+                    )
+                },
+            ]
+        )
+        self.assertIsNone(resolved)
+
+    def test_packed_mtp_expert_in_later_shard_keeps_quantization(self):
+        quant_config, resolved = self._resolve_checkpoint(
+            [
+                {
+                    "mtp.layers.0.mlp.shared_expert.gate_proj.weight": torch.zeros(
+                        4, 4, dtype=torch.bfloat16
+                    )
+                },
+                {
+                    "mtp.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(
+                        4, 4, dtype=torch.bfloat16
+                    )
+                },
+                {
+                    "mtp.layers.0.mlp.experts.1.gate_proj.weight": torch.zeros(
+                        4, 2, dtype=torch.uint8
+                    )
+                },
+            ]
+        )
+        self.assertIs(resolved, quant_config)
+
+    def test_missing_draft_experts_keeps_quantization(self):
+        quant_config, resolved = self._resolve_checkpoint(
+            [
+                {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(
+                        4, 4, dtype=torch.bfloat16
+                    )
+                },
+            ]
+        )
+        self.assertIs(resolved, quant_config)
+
+    def test_draft_quantization_scale_keeps_quantization(self):
+        quant_config, resolved = self._resolve_checkpoint(
+            [
+                {
+                    "mtp.layers.0.mlp.experts.0.gate_proj.weight": torch.zeros(
+                        4, 4, dtype=torch.bfloat16
+                    ),
+                    "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale": torch.ones(1),
+                },
+            ]
+        )
+        self.assertIs(resolved, quant_config)
+
     def test_mixed_quark_checkpoint_keeps_quantization(self):
         """Routed experts stay MXFP4, so the draft must stay quantized."""
         quant_config = _FakeQuantConfig("quark", _MIXED_EXCLUDES)
